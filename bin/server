@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 
-'use strict';
-
 require('babel-polyfill');
+require('./util/env').load('production');
 
+const path = require('path');
 const yargs = require('yargs');
 const planify = require('planify');
+const pify = require('pify');
 const internalIp = require('internal-ip');
 const express = require('express');
 const compression = require('compression');
-const validator = require('./util/validator');
-
-const projectDir = `${__dirname}/..`;
+const { read: readBuildManifest } = require('./util/manifest');
+const { publicDir } = require('./util/constants');
 
 // ---------------------------------------------------------
 // CLI definition
@@ -20,16 +20,16 @@ const projectDir = `${__dirname}/..`;
 const argv = yargs
 .strict()
 .wrap(Math.min(120, yargs.terminalWidth()))
-.help('help')
+.help()
 .alias('help', 'h')
+.version()
+.alias('version', 'v')
 .usage('Usage: ./$0 [options]')
-.demand(0, 0)
-.env('SERVER')
-.option('hostname', {
+.option('host', {
     alias: 'H',
     type: 'string',
-    default: process.env.HOSTNAME || '0.0.0.0',
-    describe: 'The hostname to bind to',
+    default: process.env.HOST || process.env.HOSTNAME || '0.0.0.0',
+    describe: 'The host to bind to',
 })
 .option('port', {
     alias: 'p',
@@ -40,11 +40,10 @@ const argv = yargs
 .option('gzip', {
     alias: 'gz',
     type: 'boolean',
-    default: true,
+    default: process.env.GZIP === '1',
     describe: 'Enable or disable gzip compression',
 })
 .option('reporter', {
-    alias: ['r', 'R'],
     type: 'string',
     describe: 'Any of the planify\'s reporters',
 })
@@ -56,20 +55,38 @@ const argv = yargs
 // Functions
 // ---------------------------------------------------------
 
-function runServer() {
+function prepare(data) {
+    // Read the manifest & import the server code
+    data.buildManifest = readBuildManifest();
+
+    const serverFile = `${publicDir}/build/${data.buildManifest.server.file}`;
+
+    try {
+        data.exports = require(serverFile);
+    } catch (err) {
+        err.detail = `This error happened when loading the server file at ${path.relative('', serverFile)}`;
+        err.hideStack = false;
+        throw err;
+    }
+
+    process.stdout.write(`Build hash: ${data.buildManifest.hash}\n`);
+    process.stdout.write(`Server build hash: ${data.buildManifest.server.hash}\n`);
+}
+
+async function runServer(data) {
+    const { host, port, gzip } = argv;
     const app = express();
 
     // Configure express app
-    app.set('env', 'production');  // Enable production mode
     app.set('etag', false);  // Not necessary by default
     app.set('x-powered-by', false);  // Remove x-powered-by header
 
     // Enable gzip compression
-    argv.gzip && app.use('/', compression());
+    gzip && app.use('/', compression());
 
     // Public files in /build have the following pattern: <file>.<hash>.<extension>
     // Therefore it's safe to cache them indefinitely
-    app.use('/build', express.static(`${projectDir}/web/build`, {
+    app.use('/build', express.static(`${publicDir}/build`, {
         maxAge: 31557600000,  // 1 year
         etag: false,  // Not necessary
         index: false,  // Disable directory listing
@@ -77,56 +94,65 @@ function runServer() {
     }));
 
     // The rest of the public files are served using a more modest approach using etags
-    app.use('/', express.static(`${projectDir}/web`, {
+    app.use(express.static(publicDir, {
         index: false,
     }));
 
-    // If it's not a public file, then try to render it using the server-renderer
-    const serverRender = require(`${projectDir}/web/build/server-renderer`).default;  // eslint-disable-line global-require
-    const serverRenderError = require(`${projectDir}/web/build/server-renderer`).renderError;  // eslint-disable-line global-require
-    const buildManifest = require(`${projectDir}/web/build/.manifest.json`);  // eslint-disable-line global-require
-    const env = buildManifest.env || 'N/A';
+    // There's no compilation to be done here, just copy stuff to `res.locals`
+    app.use((req, res, next) => {
+        res.locals.exports = data.exports;
+        res.locals.buildManifest = data.buildManifest;
+        next();
+    });
 
-    app.get('*',
+    // If it's not a public file, render the app!
+    app.use(
+        // There's no compilation to be done, just set the `res.locals`
         (req, res, next) => {
-            serverRender({ req, res, buildManifest })
-            .catch((err) => setImmediate(() => next(err)));
+            res.locals.exports = data.exports;
+            res.locals.buildManifest = data.buildManifest;
+            next();
         },
-        // Error middleware to call "renderError()" from the server-renderer
+        // Call `render()` from the server bundle to render the app
+        (req, res, next) => {
+            const { exports, buildManifest } = res.locals;
+
+            Promise.resolve(exports.render({ req, res, buildManifest }))
+            .catch(next);
+        },
+        // Call `renderError(err)` from the server bundle on errors
         (err, req, res, next) => {
-            if (!err) {
-                return next();
+            const { exports, buildManifest } = res.locals;
+
+            // Skip if there's no defined `renderError`
+            if (!exports.renderError) {
+                return next(err);
             }
 
-            serverRenderError({ err, req, res, buildManifest })
-            .catch((err) => setImmediate(() => next(err)));
+            Promise.resolve(exports.renderError({ err, req, res, buildManifest }))
+            .catch(next);
         }
     );
 
     // Start server
-    return new Promise((resolve, reject) => {
-        const isLocalOnly = argv.hostname === 'localhost' || argv.hostname === '127.0.0.1';
+    await pify(app.listen).call(app, port, host);
 
-        process.stdout.write(`Environment:               ${env}\n`);
-        process.stdout.write(`Server address:            http://${argv.hostname}:${argv.port}\n`);
-        !isLocalOnly && process.stdout.write(`LAN server address:        http://${internalIp.v4()}:${argv.port}\n`);
-        process.stdout.write(`Gzip compression:          ${argv.gzip ? 'on' : 'off'}\n`);
+    const url = `http://${host}:${port}`;
+    const lanIp = await internalIp.v4();
+    const lanUrl = `http://${lanIp}:${port}`;
 
-        app.listen(argv.port, argv.hostname, (err) => {
-            if (err) {
-                return reject(err);
-            }
-
-            process.stdout.write('\nServer is now up and running, press CTRL-C to stop.\n');
-        });
-    });
+    process.stdout.write(`Server address:            ${url}\n`);
+    process.stdout.write(`LAN server address:        ${lanUrl}\n`);
+    process.stdout.write(`Gzip compression:          ${gzip ? 'on' : 'off'}\n`);
+    process.stdout.write('\nServer is now up and running, press CTRL-C to stop.\n\n');
 }
 
 // ---------------------------------------------------------
 // Steps
 // ---------------------------------------------------------
 
-planify({ exit: true, reporter: argv.reporter })
-.step('Validating build', () => validator.validateBuild())
-.step('Running server', () => runServer())
-.run();
+planify()
+.step('Preparing', (data) => prepare(data))
+.step('Running server', (data) => runServer(data))
+.run({ reporter: argv.reporter })
+.catch((err) => process.exit(err.exitCode || 1));

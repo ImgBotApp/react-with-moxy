@@ -1,12 +1,9 @@
 /* eslint camelcase:0, global-require:0 */
 
-'use strict';
-
-const assert = require('assert');
 const path = require('path');
-const assign = require('lodash/assign');
-const projectDir = path.resolve(`${__dirname}/../..`);
-const packageJson = require(`${projectDir}/package.json`);
+const sameOrigin = require('same-origin');
+const constants = require('../util/constants');
+const { toWebpackDefinePlugin: envToWebpackDefinePlugin } = require('../util/env');
 
 // Webpack plugins
 const SvgStorePlugin = require('external-svg-sprite-loader/lib/SvgStorePlugin');
@@ -14,39 +11,35 @@ const NamedModulesPlugin = require('webpack/lib/NamedModulesPlugin');
 const LoaderOptionsPlugin = require('webpack/lib/LoaderOptionsPlugin');
 const NoEmitOnErrorsPlugin = require('webpack/lib/NoEmitOnErrorsPlugin');
 const DefinePlugin = require('webpack/lib/DefinePlugin');
+const ModuleConcatenationPlugin = require('webpack/lib/optimize/ModuleConcatenationPlugin');
 const ExtractTextPlugin = require('extract-text-webpack-plugin');
 const CaseSensitivePathsPlugin = require('case-sensitive-paths-webpack-plugin');
-const WebpackNotifierPlugin = require('webpack-notifier');
 
-module.exports = (options) => {
-    options = assign({ env: 'dev' }, options);
-    options.build = options.build != null ? !!options.build : options.env !== 'dev';
-    options.minify = options.minify != null ? !!options.minify : options.env !== 'dev';
-
-    // Ensure that some options play well together
-    options.env !== 'dev' && assert(options.build === true, `Option "build" must be enabled for env ${options.env}`);
-    !options.build && assert(options.minify === false, `Option "minify" must be disabled when "build" is disabled for env ${options.env}`);
-
-    const config = require(`${projectDir}/config/config-${options.env}`);
+module.exports = ({ minify } = {}) => {
+    const {
+        NODE_ENV: env,
+        PUBLIC_URL: publicUrl,
+        PUBLIC_ASSETS_URL: publicAssetsUrl,
+    } = process.env;
+    const isDev = env === 'development';
 
     return {
-        context: projectDir,
+        context: constants.projectDir,
         entry: {
-            'server-renderer': [
+            'server-bundle': [
                 // 'babel-polyfill',  // Do not uncomment, included only once in server and server-dev
-                './src/server-renderer.js',
+                `${constants.srcDir}/${constants.entryServerFile}`,
             ],
         },
         output: {
-            path: `${projectDir}/web/build/`,
-            publicPath: `${config.publicPath}/`,
+            path: `${constants.publicDir}/build/`,
+            publicPath: `${publicAssetsUrl}/`,
             filename: '[name].js',
             libraryTarget: 'this',
         },
         resolve: {
             alias: {
-                config: `${projectDir}/config/config-${options.env}.js`,
-                shared: `${projectDir}/src/shared`,
+                shared: path.join(constants.srcDir, 'shared'),
             },
         },
         target: 'node',  // Need this for certain libraries such as 'axios' to work
@@ -70,20 +63,25 @@ module.exports = (options) => {
                                     'es2015',
                                     'stage-3',
                                     'react',
-                                ].filter((val) => val),
+                                ],
                                 plugins: [
                                     // Necessary for import() to work
                                     'dynamic-import-node',
                                     // Transforms that optimize build
-                                    options.build ? 'transform-react-remove-prop-types' : null,
-                                    options.build ? 'transform-react-constant-elements' : null,
-                                    options.build ? 'transform-react-inline-elements' : null,
+                                    !isDev ? 'transform-react-remove-prop-types' : null,
+                                    !isDev ? 'transform-react-constant-elements' : null,
+                                    !isDev ? 'transform-react-inline-elements' : null,
                                 ].filter((val) => val),
                             },
                         },
-                        // Enable preprocess-loader so that we can use @ifdef DEV when declaring routes
+                        // Enable preprocess-loader so that we can use @ifdef SYNC_ROUTES when declaring routes
                         // See: https://github.com/gaearon/react-hot-loader/issues/288#issuecomment-281372266
-                        !options.build ? 'preprocess-loader?+DEV' : 'preprocess-loader',
+                        {
+                            loader: require.resolve('preprocess-loader'),
+                            options: {
+                                SYNC_ROUTES: true,
+                            },
+                        },
                     ],
                 },
                 // CSS files loader which enables the use of postcss & cssnext
@@ -93,7 +91,7 @@ module.exports = (options) => {
                         use: [
                             {
                                 // When building, we do not want to include the CSS contents.. the client will be responsible for that
-                                loader: options.build ? 'css-loader/locals' : 'css-loader',
+                                loader: !isDev ? 'css-loader/locals' : 'css-loader',
                                 options: {
                                     modules: true,
                                     sourceMap: true,
@@ -109,7 +107,7 @@ module.exports = (options) => {
                                         // Let postcss parse @import statements
                                         require('postcss-import')({
                                             // Any non-relative imports are resolved to this path
-                                            path: './src/shared/styles/imports',
+                                            path: `${constants.srcDir}/shared/styles/imports`,
                                         }),
                                         // Add support for CSS mixins
                                         require('postcss-mixins'),
@@ -140,13 +138,14 @@ module.exports = (options) => {
                 // inline SVGs, see: https://github.com/moxystudio/react-with-moxy/issues/6
                 {
                     test: /\.svg$/,
-                    exclude: [/\.inline\.svg$/, './src/shared/media/fonts'],
+                    exclude: [/\.inline\.svg$/, `${constants.srcDir}/shared/media/fonts`],
                     use: [
                         {
                             loader: 'external-svg-sprite-loader',
                             options: {
-                                name: 'images/svg-sprite.[hash:15].svg',
-                                prefix: 'svg',
+                                name: isDev ? 'images/svg-sprite.svg' : 'images/svg-sprite.[hash:15].svg',
+                                // Force publicPath to be local because external SVGs doesn't work on CDNs
+                                ...!sameOrigin(publicAssetsUrl, publicUrl) ? { publicPath: `${publicUrl}/build/` } : {},
                             },
                         },
                         'svg-css-modules-loader?transformId=true',
@@ -164,6 +163,7 @@ module.exports = (options) => {
                                 plugins: [
                                     { removeTitle: true },
                                     { removeDimensions: true },
+                                    { cleanupIDs: false },
                                 ],
                             },
                         },
@@ -172,32 +172,33 @@ module.exports = (options) => {
                 },
                 // Raster images (png, jpg, etc)
                 {
-                    test: /\.(png|jpg|jpeg|gif)$/,
+                    test: /\.(png|jpg|jpeg|gif|webp)$/,
                     loader: 'file-loader',
                     options: {
+                        name: isDev ? 'images/[name].[ext]' : 'images/[name].[hash:15].[ext]',
                         emitFile: false,
-                        name: 'images/[name].[hash:15].[ext]',
-                    },
-                },
-                // Videos
-                {
-                    test: /\.(mp4|webm|ogg|ogv)$/,
-                    loader: 'file-loader',
-                    options: {
-                        emitFile: false,
-                        name: 'videos/[name].[hash:15].[ext]',
                     },
                 },
                 // Web fonts
                 {
-                    test: /\.(eot|ttf|woff|woff2)$/,
+                    test: /\.(eot|ttf|woff|woff2|otf)$/,
                     loader: 'file-loader',
                     options: {
+                        name: isDev ? 'fonts/[name].[ext]' : 'fonts/[name].[hash:15].[ext]',
                         emitFile: false,
-                        name: 'fonts/[name].[hash:15].[ext]',
+                    },
+                },
+                // Audio & video
+                {
+                    test: /\.(mp3|flac|wav|aac|ogg|oga|mp4|webm|ogv)$/,
+                    loader: 'file-loader',
+                    options: {
+                        name: isDev ? 'playback/[name].[ext]' : 'playback/[name].[hash:15].[ext]',
+                        emitFile: false,
                     },
                 },
                 // Dependencies that do not work on server-side or are unnecessary for server-side rendering
+                // should be added here
                 {
                     test: [
                         // require.resolve('some-module'),
@@ -211,36 +212,30 @@ module.exports = (options) => {
             new NoEmitOnErrorsPlugin(),
             // Configure debug & minimize
             new LoaderOptionsPlugin({
-                minimize: options.minify,
-                debug: options.env === 'dev',
+                minimize: minify,
+                debug: isDev,
             }),
-            // Reduce react file size as well as other libraries
+            // Add support for environment variables under `process.env`
+            // Also replace `typeof window` so that code branch elimination is performed by uglify at build time
             new DefinePlugin({
-                'process.env': {
-                    NODE_ENV: `"${!options.build ? 'development' : 'production'}"`,
-                },
-                __CLIENT__: false,
-                __SERVER__: true,
-                __DEV__: !options.build,
+                ...envToWebpackDefinePlugin(),
+                'typeof window': '"undefined"',
             }),
-            // Enabling gives us better debugging output
+            // Add module names to factory functions so they appear in browser profiler
             new NamedModulesPlugin(),
+            // Enable scope hoisting which reduces bundle size
+            new ModuleConcatenationPlugin(),
             // Alleviate cases where developers working on OSX, which does not follow strict path case sensitivity
             new CaseSensitivePathsPlugin(),
             // At the moment we only generic a single app CSS file which is kind of bad, see: https://github.com/webpack-contrib/extract-text-webpack-plugin/issues/332
             new ExtractTextPlugin({
-                filename: 'app.css',
+                filename: 'css/main.css',
                 allChunks: true,
-                disable: options.build,
+                disable: !isDev,
             }),
             // External svg sprite plugin
             new SvgStorePlugin({ emit: false }),
-            // Display build status system notification to the user
-            !options.build && new WebpackNotifierPlugin({
-                title: packageJson.name,
-                contentImage: `${projectDir}/web/favicon.ico`,
-            }),
         ].filter((val) => val),
-        devtool: false,  // Not necessary because they are not supported in NodeJS (maybe they are?)
+        devtool: false,
     };
 };

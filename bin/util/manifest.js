@@ -1,74 +1,117 @@
-'use strict';
+const fs = require('fs');
+const path = require('path');
+const sortChunks = require('webpack-sort-chunks').default;
+const escapeRegExp = require('lodash/escapeRegExp');
+const castArray = require('lodash/castArray');
+const merge = require('deepmerge');
+const { publicDir } = require('./constants');
 
-const reduce = require('lodash/reduce');
-const _merge = require('lodash/merge');
+function parseWebpackStats(stats) {
+    const { hash, publicPath } = stats;
 
-const routeRegExp = /src\/pages\/([a-z][a-z-_/]+)\/index\.js$/;
+    // Generate assets, grouping by extension/secondary
+    // Note that we must sort chunks so that dependency order is correct
+    const assets = sortChunks(stats.chunks).reduce((assets, chunk) => {
+        chunk.files
+        .filter((file) => !file.endsWith('.map')) // Exclude source map files
+        .forEach((file) => {
+            const ext = path.extname(file).substr(1);
+            const key = chunk.initial ? ext : 'secondary';
 
-function fromWebpackStats(stats) {
-    stats = stats.toJson();
-
-    // Gather assets
-    const assets = reduce(stats.assetsByChunkName, (aggregatedAssets, assets) => {
-        assets = Array.isArray(assets) ? assets : [assets];
-        assets.forEach((asset) => {
-            const key = asset.replace(/\.[a-z0-9]{15,32}(\.[a-z0-9]+)$/, '$1');  // Remove hash
-
-            aggregatedAssets[key] = stats.publicPath + asset;
-        });
-
-        return aggregatedAssets;
-    }, {});
-
-    // Gather async routes
-    const asyncRoutes = stats.chunks.reduce((routes, chunk) => {
-        if (!chunk.entry && chunk.origins) {
-            chunk.origins.some((origin) => {
-                const match = origin.module.match(routeRegExp);
-                const name = match && match[1];
-
-                if (name) {
-                    routes[name] = stats.publicPath + chunk.files[0];
-                }
-
-                return match;
+            assets[key] = assets[key] || [];
+            assets[key].push({
+                file,
+                url: stats.publicPath + file,
             });
-        }
-
-        return routes;
-    }, {});
-
-    // Gather sync routes
-    const syncRoutes = stats.modules.reduce((routes, module) => {
-        module.reasons.forEach((reason) => {
-            const match = reason.module.match(routeRegExp);
-            const name = match && match[1];
-
-            if (name && !asyncRoutes[name]) {
-                routes[name] = true;
-            }
-
-            return match;
         });
 
-        return routes;
-    }, {});
+        return assets;
+    }, { js: [], css: [], secondary: [] });
 
     return {
+        hash,
+        publicPath,
         assets,
-        routes: {
-            sync: syncRoutes,
-            async: asyncRoutes,
-        },
     };
 }
 
-function merge(serverBuildData, clientBuildData) {
-    // No fancy merging for now..
-    return _merge(serverBuildData, clientBuildData);
+function removeServerBundle(manifest, stats) {
+    // Grab the server chunk name & asset
+    const chunkName = Object.keys(stats.entrypoints)[0];
+    const asset = castArray(stats.assetsByChunkName[chunkName])[0];
+
+    // Remove it from the assets
+    const bundleRegExp = new RegExp(`${escapeRegExp(asset)}(\\.map)?$`);
+
+    manifest.assets.js = manifest.assets.js.filter(({ file }) => !bundleRegExp.test(file));
+
+    return asset;
+}
+
+// ---------------------------------------------------
+
+function build({ client: clientStats, server: serverStats }) {
+    // Convert stats to objects
+    clientStats = clientStats.toJson();
+    serverStats = serverStats.toJson();
+
+    // Do a common parse of the stats
+    const clientManifest = parseWebpackStats(clientStats);
+    const serverManifest = parseWebpackStats(serverStats);
+
+    // Remove server bundle from assets
+    const serverFile = removeServerBundle(serverManifest, serverStats);
+
+    // Merge manifests, giving more importance to the client
+    const manifest = merge(serverManifest, clientManifest, {
+        arrayMerge: (destinationArray, sourceArray) => [...sourceArray, ...destinationArray],
+        clone: true,
+    });
+
+    // Add server to manifest
+    manifest.server = {
+        hash: serverManifest.hash,
+        file: serverFile,
+    };
+
+    return manifest;
+}
+
+function write(stats) {
+    const manifest = build(stats);
+    const manifestJson = JSON.stringify(manifest, null, 4);
+    const manifestFile = path.join(publicDir, 'build/build-manifest.json');
+
+    try {
+        fs.writeFileSync(manifestFile, manifestJson);
+    } catch (err) {
+        err.message = `Could not write manifest file on ${path.relative('', manifestFile)}`;
+        err.detail = err.code === 'ENOENT' ? 'Did you forgot to build the project?' : err.message;
+
+        throw err;
+    }
+
+    return manifest;
+}
+
+function read() {
+    const manifestFile = path.join(publicDir, 'build/build-manifest.json');
+    let manifestJson;
+
+    try {
+        manifestJson = fs.readFileSync(manifestFile);
+    } catch (err) {
+        err.message = `Could not read manifest file on ${path.relative('', manifestFile)}`;
+        err.detail = err.code === 'ENOENT' ? 'Did you forgot to build the project?' : err.message;
+
+        throw err;
+    }
+
+    return JSON.parse(manifestJson);
 }
 
 module.exports = {
-    fromWebpackStats,
-    merge,
+    build,
+    write,
+    read,
 };

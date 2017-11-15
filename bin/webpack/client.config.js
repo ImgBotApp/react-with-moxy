@@ -1,11 +1,9 @@
 /* eslint camelcase:0, global-require:0 */
 
-'use strict';
-
-const assert = require('assert');
 const path = require('path');
-const assign = require('lodash/assign');
-const projectDir = path.resolve(`${__dirname}/../..`);
+const sameOrigin = require('same-origin');
+const constants = require('../util/constants');
+const { toWebpackDefinePlugin: envToWebpackDefinePlugin } = require('../util/env');
 
 // Webpack plugins
 const SvgStorePlugin = require('external-svg-sprite-loader/lib/SvgStorePlugin');
@@ -14,46 +12,41 @@ const LoaderOptionsPlugin = require('webpack/lib/LoaderOptionsPlugin');
 const HotModuleReplacementPlugin = require('webpack/lib/HotModuleReplacementPlugin');
 const NoEmitOnErrorsPlugin = require('webpack/lib/NoEmitOnErrorsPlugin');
 const DefinePlugin = require('webpack/lib/DefinePlugin');
+const ModuleConcatenationPlugin = require('webpack/lib/optimize/ModuleConcatenationPlugin');
 const UglifyJsPlugin = require('webpack/lib/optimize/UglifyJsPlugin');
 const ExtractTextPlugin = require('extract-text-webpack-plugin');
 const CaseSensitivePathsPlugin = require('case-sensitive-paths-webpack-plugin');
 
-module.exports = (options) => {
-    options = assign({ env: 'dev' }, options);
-    options.build = options.build != null ? !!options.build : options.env !== 'dev';
-    options.minify = options.minify != null ? !!options.minify : options.env !== 'dev';
-
-    // Ensure that some options play well together
-    options.env !== 'dev' && assert(options.build === true, `Option "build" must be enabled for env ${options.env}`);
-    !options.build && assert(options.minify === false, `Option "minify" must be disabled when "build" is disabled for env ${options.env}`);
-
-    const config = require(`${projectDir}/config/config-${options.env}`);
+module.exports = ({ minify } = {}) => {
+    const {
+        NODE_ENV: env,
+        PUBLIC_URL: publicUrl,
+        PUBLIC_ASSETS_URL: publicAssetsUrl,
+    } = process.env;
+    const isDev = env === 'development';
 
     return {
-        context: projectDir,
+        context: constants.projectDir,
         entry: {
             main: [
-                'babel-polyfill',  // Necessary for babel to run (replaces babel-polyfill)
-                'dom4',  // Adds dom4 polyfills, such as Element.remove(), etc
-                !options.build && 'eventsource-polyfill',  // Necessary to make hmr work on IE
-                !options.build && 'react-hot-loader/patch',  // For hot module reload
-                !options.build && 'webpack-hot-middleware/client?reload=true',  // For hot module reload
-                './src/client-renderer.js',
-            ].filter((val) => val),
-            deferrable: [
-                'svgxuse',  // Necessary because external svgs need a polyfill in IE
-            ],
+                require.resolve('babel-polyfill'),  // Necessary for babel to run (replaces babel-polyfill)
+                require.resolve('dom4'),  // Adds dom4 polyfills, such as Element.remove(), etc
+                isDev && require.resolve('eventsource-polyfill'),  // Necessary to make hmr work on IE
+                isDev && require.resolve('react-hot-loader/patch'),  // For hot module reload
+                isDev && `${require.resolve('webpack-hot-middleware/client')}?reload=true`,  // For hot module reload
+                path.join(constants.srcDir, constants.entryClientFile),
+            ]
+            .filter((file) => file),
         },
         output: {
-            path: `${projectDir}/web/build/`,
-            publicPath: `${config.publicPath}/`,
-            filename: !options.build ? '[name].js' : '[name].[chunkhash].js',
-            chunkFilename: !options.build ? 'chunk.[name].js' : 'chunk.[name].[chunkhash].js',
+            path: path.join(constants.publicDir, 'build'),
+            publicPath: `${publicAssetsUrl}/`,
+            filename: isDev ? 'js/[name].js' : 'js/[name].[chunkhash].js',
+            chunkFilename: isDev ? 'js/chunk.[name].js' : 'js/chunk.[name].[chunkhash].js',
         },
         resolve: {
             alias: {
-                config: `${projectDir}/config/config-${options.env}.js`,
-                shared: `${projectDir}/src/shared`,
+                shared: path.join(constants.srcDir, 'shared'),
             },
         },
         node: {
@@ -68,29 +61,37 @@ module.exports = (options) => {
                     exclude: /node_modules/,
                     use: [
                         {
-                            loader: 'babel-loader',
+                            loader: require.resolve('babel-loader'),
                             options: {
                                 cacheDirectory: true,
                                 presets: [
-                                    'es2015',
-                                    'stage-3',
-                                    'react',
-                                ].filter((val) => val),
+                                    'babel-preset-es2015',
+                                    'babel-preset-stage-3',
+                                    'babel-preset-react',
+                                ]
+                                .map((path) => require.resolve(path)),
                                 plugins: [
                                     // Necessary for import() to work
-                                    'syntax-dynamic-import',
+                                    require.resolve('babel-plugin-syntax-dynamic-import'),
                                     // <3 hot module reload
-                                    !options.build ? 'react-hot-loader/babel' : null,
+                                    isDev ? 'react-hot-loader/babel' : null,
                                     // Transforms that optimize build
-                                    options.build ? 'transform-react-remove-prop-types' : null,
-                                    options.build ? 'transform-react-constant-elements' : null,
-                                    options.build ? 'transform-react-inline-elements' : null,
-                                ].filter((val) => val),
+                                    !isDev ? 'babel-plugin-transform-react-remove-prop-types' : null,
+                                    !isDev ? 'babel-plugin-transform-react-constant-elements' : null,
+                                    !isDev ? 'babel-plugin-transform-react-inline-elements' : null,
+                                ]
+                                .filter((plugin) => plugin)
+                                .map((path) => require.resolve(path)),
                             },
                         },
                         // Enable preprocess-loader so that we can use @ifdef DEV when declaring routes
                         // See: https://github.com/gaearon/react-hot-loader/issues/288#issuecomment-281372266
-                        !options.build ? 'preprocess-loader?+DEV' : 'preprocess-loader',
+                        {
+                            loader: require.resolve('preprocess-loader'),
+                            options: {
+                                SYNC_ROUTES: isDev ? true : undefined,
+                            },
+                        },
                     ],
                 },
                 // CSS files loader which enables the use of postcss & cssnext
@@ -98,14 +99,14 @@ module.exports = (options) => {
                     test: /\.css$/,
                     loader: ExtractTextPlugin.extract({
                         fallback: {
-                            loader: 'style-loader',
+                            loader: require.resolve('style-loader'),
                             options: {
-                                convertToAbsoluteUrls: !options.build,
+                                convertToAbsoluteUrls: isDev,
                             },
                         },
                         use: [
                             {
-                                loader: 'css-loader',
+                                loader: require.resolve('css-loader'),
                                 options: {
                                     modules: true,
                                     sourceMap: true,
@@ -115,13 +116,13 @@ module.exports = (options) => {
                                 },
                             },
                             {
-                                loader: 'postcss-loader',
+                                loader: require.resolve('postcss-loader'),
                                 options: {
                                     plugins: [
                                         // Let postcss parse @import statements
                                         require('postcss-import')({
                                             // Any non-relative imports are resolved to this path
-                                            path: './src/shared/styles/imports',
+                                            path: path.join(constants.srcDir, 'shared/styles/imports'),
                                         }),
                                         // Add support for CSS mixins
                                         require('postcss-mixins'),
@@ -148,20 +149,28 @@ module.exports = (options) => {
                     }),
                 },
                 // Load SVG files and create an external sprite
-                // While this has a lot of advantages, such as not blocking the initial load, it can't contain
-                // inline SVGs, see: https://github.com/moxystudio/react-with-moxy/issues/6
+                // While this has a lot of advantages such as not blocking the initial load,
+                // it might not workout for every SVG, see: https://github.com/moxystudio/react-with-moxy/issues/6
                 {
                     test: /\.svg$/,
-                    exclude: [/\.inline\.svg$/, './src/shared/media/fonts'],
+                    exclude: [/\.inline\.svg$/, path.join(constants.srcDir, 'shared/media/fonts')],
                     use: [
                         {
-                            loader: 'external-svg-sprite-loader',
+                            loader: require.resolve('external-svg-sprite-loader'),
                             options: {
-                                name: 'images/svg-sprite.[hash:15].svg',
-                                prefix: 'svg',
+                                name: isDev ? 'images/svg-sprite.svg' : 'images/svg-sprite.[hash:15].svg',
+                                // Force publicPath to be local because external SVGs doesn't work on CDNs
+                                ...!sameOrigin(publicAssetsUrl, publicUrl) ? { publicPath: `${publicUrl}/build/` } : {},
                             },
                         },
-                        'svg-css-modules-loader?transformId=true',
+                        // Uniquify classnames and ids so that if svgxuse injects the sprite into the body,
+                        // it doesn't cause DOM conflicts
+                        {
+                            loader: require.resolve('svg-css-modules-loader'),
+                            options: {
+                                transformId: true,
+                            },
+                        },
                     ],
                 },
                 // Loader for inline SVGs to support SVGs that do not integrate well with external-svg-sprite-loader,
@@ -169,41 +178,48 @@ module.exports = (options) => {
                 {
                     test: /\.inline\.svg$/,
                     use: [
-                        'raw-loader',
+                        require.resolve('raw-loader'),
                         {
-                            loader: 'svgo-loader',
+                            loader: require.resolve('svgo-loader'),
                             options: {
                                 plugins: [
                                     { removeTitle: true },
                                     { removeDimensions: true },
+                                    { cleanupIDs: false },
                                 ],
                             },
                         },
-                        'svg-css-modules-loader?transformId=true',
+                        // Uniquify classnames and ids so they don't conflict with eachother
+                        {
+                            loader: require.resolve('svg-css-modules-loader'),
+                            options: {
+                                transformId: true,
+                            },
+                        },
                     ],
                 },
                 // Raster images (png, jpg, etc)
                 {
-                    test: /\.(png|jpg|jpeg|gif)$/,
-                    loader: 'file-loader',
+                    test: /\.(png|jpg|jpeg|gif|webp)$/,
+                    loader: require.resolve('file-loader'),
                     options: {
-                        name: 'images/[name].[hash:15].[ext]',
-                    },
-                },
-                // Videos
-                {
-                    test: /\.(mp4|webm|ogg|ogv)$/,
-                    loader: 'file-loader',
-                    options: {
-                        name: 'videos/[name].[hash:15].[ext]',
+                        name: isDev ? 'images/[name].[ext]' : 'images/[name].[hash:15].[ext]',
                     },
                 },
                 // Web fonts
                 {
-                    test: /\.(eot|ttf|woff|woff2)$/,
-                    loader: 'file-loader',
+                    test: /\.(eot|ttf|woff|woff2|otf)$/,
+                    loader: require.resolve('file-loader'),
                     options: {
-                        name: 'fonts/[name].[hash:15].[ext]',
+                        name: isDev ? 'fonts/[name].[ext]' : 'fonts/[name].[hash:15].[ext]',
+                    },
+                },
+                // Audio & video
+                {
+                    test: /\.(mp3|flac|wav|aac|ogg|oga|mp4|webm|ogv)$/,
+                    loader: require.resolve('file-loader'),
+                    options: {
+                        name: isDev ? 'playback/[name].[ext]' : 'playback/[name].[hash:15].[ext]',
                     },
                 },
             ],
@@ -213,43 +229,41 @@ module.exports = (options) => {
             new NoEmitOnErrorsPlugin(),
             // Configure debug & minimize
             new LoaderOptionsPlugin({
-                minimize: options.minify,
-                debug: !options.build,
+                minimize: minify,
+                debug: isDev,
             }),
-            // Reduce react file size as well as other libraries
+            // Add support for environment variables under `process.env`
+            // Also replace `typeof window` so that code branch elimination is performed by uglify at build time
             new DefinePlugin({
-                'process.env': {
-                    NODE_ENV: `"${!options.build ? 'development' : 'production'}"`,
-                },
-                __CLIENT__: true,
-                __SERVER__: false,
-                __DEV__: !options.build,
+                ...envToWebpackDefinePlugin(),
+                'typeof window': '"object"',
             }),
             // Enabling gives us better debugging output
             new NamedModulesPlugin(),
+            // Enable scope hoisting which reduces bundle size
+            new ModuleConcatenationPlugin(),
             // Ensures that hot reloading works
-            !options.build && new HotModuleReplacementPlugin(),
+            isDev && new HotModuleReplacementPlugin(),
             // Alleviate cases where developers working on OSX, which does not follow strict path case sensitivity
             new CaseSensitivePathsPlugin(),
             // At the moment we only generic a single app CSS file which is kind of bad, see: https://github.com/webpack-contrib/extract-text-webpack-plugin/issues/332
             new ExtractTextPlugin({
-                filename: 'app.[contenthash:15].css',
+                filename: 'css/main.[contenthash:15].css',
                 allChunks: true,
-                disable: !options.build,
+                disable: isDev,
             }),
             // External svg sprite plugin
             new SvgStorePlugin(),
             // Minify JS
-            options.minify && new UglifyJsPlugin({
+            minify && new UglifyJsPlugin({
                 mangle: true,
                 compress: {
                     warnings: false,      // Mute warnings
                     drop_console: true,   // Drop console.* statements
                     drop_debugger: true,  // Drop debugger statements
-                    screw_ie8: true,      // We don't support IE8 and lower, this further improves compression
                 },
             }),
         ].filter((val) => val),
-        devtool: options.build ? 'source-map' : 'eval-source-map',
+        devtool: isDev ? 'eval-source-map' : 'source-map',
     };
 };

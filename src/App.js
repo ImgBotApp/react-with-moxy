@@ -34,9 +34,8 @@ App.propTypes = {
 
 export function buildRoutes() {
     return {
-        path: '/',
         component: App,
-        childRoutes: buildPageRoutes(),
+        ...buildPageRoutes(),
     };
 }
 

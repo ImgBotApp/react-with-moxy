@@ -1,20 +1,17 @@
-/* eslint-disable react/jsx-no-bind */
-
 import React from 'react';
 import { renderToString } from 'react-dom/server';
 import { match, RouterContext, createMemoryHistory } from 'react-router';
 import Helmet from 'react-helmet';
-import config from 'config';
 import pify from 'pify';
 import { buildRoutes } from './App';
-import renderDocument from '../web/.index.html';
+import renderDocument from './index.html';
 
 const matchAsync = pify(match, { multiArgs: true });
 
 // Build our routes
 const routes = buildRoutes();
 
-export default async function render({ req, res, buildManifest }) {
+export async function render({ req, res, buildManifest }) {
     // Match req against our routes
     const history = createMemoryHistory();
     const [redirectLocation, renderProps] = await matchAsync({ history, routes, location: req.url });
@@ -41,7 +38,6 @@ export default async function render({ req, res, buildManifest }) {
     const html = renderDocument({
         head: Helmet.rewind(),
         rootHtml,
-        config,
         buildManifest,
     });
 
@@ -76,12 +72,9 @@ export async function renderError({ err, req, res, buildManifest }) {
     const html = renderDocument({
         head: Helmet.rewind(),
         rootHtml,
-        config,
         buildManifest,
     });
 
     // Send HTML
     res.send(html);
 }
-
-export { config };
